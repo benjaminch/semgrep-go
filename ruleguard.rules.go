@@ -35,6 +35,7 @@ func unconvert(m fluent.Matcher) {
 func timeeq(m fluent.Matcher) {
 	m.Match("$t0 == $t1").Where(m["t0"].Type.Is("time.Time")).Report("using == with time.Time")
 	m.Match("$t0 != $t1").Where(m["t0"].Type.Is("time.Time")).Report("using != with time.Time")
+	m.Match(`map[$k]$v`).Where(m["k"].Type.Is("time.Time")).Report("map with time.Time keys are easy to misuse")
 }
 
 // Wrong err in error check
@@ -245,7 +246,7 @@ func constswitch(m fluent.Matcher) {
 		Report("constant switch")
 }
 
-func oddcomparisions(m fluent.Matcher) {
+func oddcomparisons(m fluent.Matcher) {
 	m.Match(
 		"$x - $y == 0",
 		"$x - $y != 0",
@@ -336,8 +337,143 @@ func urlredacted(m fluent.Matcher) {
 }
 
 func sprinterr(m fluent.Matcher) {
-	m.Match("fmt.Sprint($err)").
+	m.Match(`fmt.Sprint($err)`,
+		`fmt.Sprintf("%s", $err)`,
+		`fmt.Sprintf("%v", $err)`,
+	).
 		Where(m["err"].Type.Is("error")).
 		Report("maybe call $err.Error() instead of fmt.Sprint()?")
 
+}
+
+func largeloopcopy(m fluent.Matcher) {
+	m.Match(
+		`for $_, $v := range $_ { $*_ }`,
+	).
+		Where(m["v"].Type.Size > 512).
+		Report(`loop copies large value each iteration`)
+}
+
+func joinpath(m fluent.Matcher) {
+	m.Match(
+		`strings.Join($_, "/")`,
+		`strings.Join($_, "\\")`,
+		"strings.Join($_, `\\`)",
+	).
+		Report(`did you mean path.Join() or filepath.Join() ?`)
+}
+
+func readfull(m fluent.Matcher) {
+	m.Match(`$n, $err := io.ReadFull($_, $slice)
+                 if $err != nil || $n != len($slice) {
+                              $*_
+		 }`,
+		`$n, $err := io.ReadFull($_, $slice)
+                 if $n != len($slice) || $err != nil {
+                              $*_
+		 }`,
+		`$n, $err = io.ReadFull($_, $slice)
+                 if $err != nil || $n != len($slice) {
+                              $*_
+		 }`,
+		`$n, $err = io.ReadFull($_, $slice)
+                 if $n != len($slice) || $err != nil {
+                              $*_
+		 }`,
+		`if $n, $err := io.ReadFull($_, $slice); $n != len($slice) || $err != nil {
+                              $*_
+		 }`,
+		`if $n, $err := io.ReadFull($_, $slice); $err != nil || $n != len($slice) {
+                              $*_
+		 }`,
+		`if $n, $err = io.ReadFull($_, $slice); $n != len($slice) || $err != nil {
+                              $*_
+		 }`,
+		`if $n, $err = io.ReadFull($_, $slice); $err != nil || $n != len($slice) {
+                              $*_
+		 }`,
+	).Report("io.ReadFull() returns err == nil iff n == len(slice)")
+}
+
+func nilerr(m fluent.Matcher) {
+	m.Match(
+		`if err == nil { return err }`,
+		`if err == nil { return $*_, err }`,
+	).
+		Report(`return nil error instead of nil value`)
+
+}
+
+func mailaddress(m fluent.Matcher) {
+	m.Match(
+		"fmt.Sprintf(`\"%s\" <%s>`, $NAME, $EMAIL)",
+		"fmt.Sprintf(`\"%s\"<%s>`, $NAME, $EMAIL)",
+		"fmt.Sprintf(`%s <%s>`, $NAME, $EMAIL)",
+		"fmt.Sprintf(`%s<%s>`, $NAME, $EMAIL)",
+		`fmt.Sprintf("\"%s\"<%s>", $NAME, $EMAIL)`,
+		`fmt.Sprintf("\"%s\" <%s>", $NAME, $EMAIL)`,
+		`fmt.Sprintf("%s<%s>", $NAME, $EMAIL)`,
+		`fmt.Sprintf("%s <%s>", $NAME, $EMAIL)`,
+	).
+		Report("use net/mail Address.String() instead of fmt.Sprintf()").
+		Suggest("(&mail.Address{Name:$NAME, Address:$EMAIL}).String()")
+
+}
+
+func errnetclosed(m fluent.Matcher) {
+	m.Match(
+		`strings.Contains($err.Error(), $text)`,
+	).
+		Where(m["text"].Text.Matches("\".*closed network connection.*\"")).
+		Report(`String matching against error texts is fragile; use net.ErrClosed instead`).
+		Suggest(`errors.Is($err, net.ErrClosed)`)
+
+}
+
+func httpheaderadd(m fluent.Matcher) {
+	m.Match(
+		`$H.Add($KEY, $VALUE)`,
+	).
+		Where(m["H"].Type.Is("http.Header")).
+		Report("use http.Header.Set method instead of Add to overwrite all existing header values").
+		Suggest(`$H.Set($KEY, $VALUE)`)
+}
+
+func hmacnew(m fluent.Matcher) {
+	m.Match("hmac.New(func() hash.Hash { return $x }, $_)",
+		`$f := func() hash.Hash { return $x }
+	$*_
+	hmac.New($f, $_)`,
+	).Where(m["x"].Pure).
+		Report("invalid hash passed to hmac.New()")
+}
+
+func readeof(m fluent.Matcher) {
+	m.Match(
+		`$n, $err = $r.Read($_)
+	if $err != nil {
+	    return $*_
+	}`,
+		`$n, $err := $r.Read($_)
+	if $err != nil {
+	    return $*_
+	}`).Where(m["r"].Type.Implements("io.Reader")).
+		Report("Read() can return n bytes and io.EOF")
+}
+
+func writestring(m fluent.Matcher) {
+	m.Match(`io.WriteString($w, string($b))`).
+		Where(m["b"].Type.Is("[]byte")).
+		Suggest("$w.Write($b)")
+}
+
+func badlock(m fluent.Matcher) {
+	// Shouldn't give many false positives without type filter
+	// as Lock+Unlock pairs in combination with defer gives us pretty
+	// a good chance to guess correctly. If we constrain the type to sync.Mutex
+	// then it'll be harder to match embedded locks and custom methods
+	// that may forward the call to the sync.Mutex (or other synchronization primitive).
+
+	m.Match(`$mu.Lock(); defer $mu.RUnlock()`).Report(`maybe $mu.RLock() was intended?`)
+	m.Match(`$mu.RLock(); defer $mu.Unlock()`).Report(`maybe $mu.Lock() was intended?`)
 }
